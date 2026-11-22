@@ -60,7 +60,17 @@ def morton_encode(x, y, z, depth):
 
     参数 depth 取 0..10 的整数。返回 int，不做任何隐式取整以外的变换。
     """
-    raise NotImplementedError
+    n = 1 << depth
+    ix = max(min(int(x * n), n - 1), 0)
+    iy = max(min(int(y * n), n - 1), 0)
+    iz = max(min(int(z * n), n - 1), 0)
+
+    code = 0
+    for i in range(depth):
+        code |= ((ix >> i) & 1) << (3 * i)
+        code |= ((iy >> i) & 1) << (3 * i + 1)
+        code |= ((iz >> i) & 1) << (3 * i + 2)
+    return code
 
 
 def morton_decode(code, depth):
@@ -81,7 +91,14 @@ def morton_decode(code, depth):
     掩码少一位会把最高位吃掉、最大坐标解成一半。
     返回三元 float 组。
     """
-    raise NotImplementedError
+    ix = iy = iz = 0
+    for i in range(depth):
+        ix |= ((code >> (3 * i)) & 1) << i
+        iy |= ((code >> (3 * i + 1)) & 1) << i
+        iz |= ((code >> (3 * i + 2)) & 1) << i
+
+    n = 1 << depth
+    return (ix / n, iy / n, iz / n)
 
 
 def child_index(px, py, pz, cx, cy, cz):
@@ -99,7 +116,10 @@ def child_index(px, py, pz, cx, cy, cz):
     同一个点会同时落进两个相邻格子的管辖范围，树里出现重复值。
     中心面三轴都命中的点（``px == cx and py == cy and pz == cz``）返回 7。
     """
-    raise NotImplementedError
+    bx = 1 if px >= cx else 0
+    by = 1 if py >= cy else 0
+    bz = 1 if pz >= cz else 0
+    return bx | (by << 1) | (bz << 2)
 
 
 def insert(root, point, value):
@@ -122,7 +142,40 @@ def insert(root, point, value):
     返回根节点本身（就地修改）。空树（``points == {}`` 且 ``children == {}``）
     插入后必须成为一条到 ``max_depth`` 的路径。
     """
-    raise NotImplementedError
+    px, py, pz = point
+    if not all(0.0 <= value < 1.0 for value in (px, py, pz)):
+        raise ValueError("point %r 不在 [0.0, 1.0)³ 内" % (point,))
+
+    max_depth = root["max_depth"]
+    node = root
+    while True:
+        if point in node["points"]:
+            node["points"][point] = value
+            return root
+        if node["depth"] >= max_depth:
+            node["points"][point] = value
+            return root
+
+        # 当前节点的中心（节点覆盖 [x / 2**d, (x + 1) / 2**d)）
+        scale = 1 << node["depth"]
+        cx = (node["x"] + 0.5) / scale
+        cy = (node["y"] + 0.5) / scale
+        cz = (node["z"] + 0.5) / scale
+        index = child_index(px, py, pz, cx, cy, cz)
+        bx, by, bz = index & 1, (index >> 1) & 1, (index >> 2) & 1
+
+        child = node["children"].get(index)
+        if child is None:
+            child = {
+                "depth": node["depth"] + 1,
+                "x": 2 * node["x"] + bx,
+                "y": 2 * node["y"] + by,
+                "z": 2 * node["z"] + bz,
+                "points": {},
+                "children": {},
+            }
+            node["children"][index] = child
+        node = child
 
 
 def query_box(root, box):
@@ -141,7 +194,36 @@ def query_box(root, box):
     返回 ``[(point, value), ...]``，point 是三元组，按字典序升序排序；
     没有命中时返回 ``[]``。
     """
-    raise NotImplementedError
+    (x0, y0, z0), (x1, y1, z1) = box
+    low = (x0, y0, z0)
+    high = (x1, y1, z1)
+    found = {}
+
+    def visit(node):
+        depth = node["depth"]
+        size = 1.0 / (1 << depth)
+        cell_low = (node["x"] * size, node["y"] * size, node["z"] * size)
+        cell_high = (
+            (node["x"] + 1) * size,
+            (node["y"] + 1) * size,
+            (node["z"] + 1) * size,
+        )
+        # 半开区间 [cell_low, cell_high) 与 [low, high) 不相交就整棵剪掉
+        for axis in range(3):
+            if cell_low[axis] >= high[axis] or low[axis] >= cell_high[axis]:
+                return
+
+        for point, value in node["points"].items():
+            if point in found:
+                continue
+            if all(low[axis] <= point[axis] < high[axis] for axis in range(3)):
+                found[point] = value
+
+        for child in node["children"].values():
+            visit(child)
+
+    visit(root)
+    return sorted(found.items(), key=lambda item: item[0])
 
 
 def merge_leaves(root):
@@ -161,7 +243,33 @@ def merge_leaves(root):
     不允许改变任何点的值，所以对任意盒子和合并前一定完全相同——这条是
     ``tests/test_node.py`` 里“合并后查询结果不变”的依据。
     """
-    raise NotImplementedError
+    def visit(node):
+        for child in list(node["children"].values()):
+            visit(child)
+
+        children = node["children"]
+        if set(children) != set(range(8)):
+            return
+        leaves = list(children.values())
+        if any(child["children"] for child in leaves):
+            return
+        if any(not child["points"] for child in leaves):
+            return
+
+        first_value = next(iter(leaves[0]["points"].values()))
+        for child in leaves:
+            for value in child["points"].values():
+                if not (value == first_value):
+                    return
+
+        merged = {}
+        for child in leaves:
+            merged.update(child["points"])
+        node["points"].update(merged)
+        node["children"] = {}
+
+    visit(root)
+    return root
 
 
 def validate_tree(root, depth):
@@ -181,7 +289,93 @@ def validate_tree(root, depth):
 
     只返回错误描述，不抛异常，也不修改树。合法的空树（只有根、没有点）返回 ``[]``。
     """
-    raise NotImplementedError
+    EPS = 1e-9
+    errors = []
+
+    def label(node):
+        return "depth=%s, (x=%s, y=%s, z=%s)" % (
+            node.get("depth"),
+            node.get("x"),
+            node.get("y"),
+            node.get("z"),
+        )
+
+    def check_node(node, parent):
+        prefix = label(node)
+        node_depth = node["depth"]
+        depth_ok = isinstance(node_depth, int) and 0 <= node_depth <= depth
+
+        if not depth_ok:
+            errors.append("%s: 节点深度越界（允许 0..%d）" % (prefix, depth))
+        if parent is None:
+            if node_depth != 0 or node["x"] != 0 or node["y"] != 0 or node["z"] != 0:
+                errors.append("%s: 根节点必须是 depth=0 且坐标为 (0, 0, 0)" % prefix)
+        else:
+            if node_depth != parent["depth"] + 1:
+                errors.append(
+                    "%s: 子节点深度应为父节点深度 + 1（父 %s）"
+                    % (prefix, label(parent))
+                )
+            # 子节点坐标的具体期望值由父节点遍历子键时校验（见下）
+
+        if depth_ok:
+            limit = 1 << node_depth
+            for axis in ("x", "y", "z"):
+                value = node[axis]
+                if not isinstance(value, int) or not (0 <= value < limit):
+                    errors.append(
+                        "%s: 坐标 %s 应在 [0, %d) 内" % (prefix, axis, limit)
+                    )
+
+        # 点必须落在本节点格子 [x/2**d, (x+1)/2**d) 内
+        if depth_ok and node["points"]:
+            size = 1.0 / (1 << node_depth)
+            lower = (node["x"] * size, node["y"] * size, node["z"] * size)
+            upper = (
+                (node["x"] + 1) * size,
+                (node["y"] + 1) * size,
+                (node["z"] + 1) * size,
+            )
+            for point in node["points"]:
+                ok = True
+                for axis in range(3):
+                    if not (lower[axis] - EPS <= point[axis] < upper[axis]):
+                        ok = False
+                        break
+                if not ok:
+                    errors.append(
+                        "%s: 点 %r 不在节点格子内" % (prefix, point)
+                    )
+
+        children = node["children"]
+        if not children:
+            # 合法的空树只有根，其它任何空叶都算错误
+            if not node["points"] and parent is not None:
+                errors.append("%s: 空叶节点（既没有点也没有子节点）" % prefix)
+            return
+
+        for index in sorted(children, key=repr):
+            child = children[index]
+            if not isinstance(index, int) or not (0 <= index < 8):
+                errors.append("%s: 子节点键 %r 不是 0..7 的整数" % (prefix, index))
+                check_node(child, node)
+                continue
+            bx, by, bz = index & 1, (index >> 1) & 1, (index >> 2) & 1
+            expected = (
+                2 * node["x"] + bx,
+                2 * node["y"] + by,
+                2 * node["z"] + bz,
+            )
+            actual = (child["x"], child["y"], child["z"])
+            if actual != expected:
+                errors.append(
+                    "%s: 子节点 %r 的坐标 %r 越出父节点格子，应为 %r"
+                    % (prefix, index, actual, expected)
+                )
+            check_node(child, node)
+
+    check_node(root, None)
+    return errors
 
 
 def octree_batch(points, config):
@@ -200,4 +394,19 @@ def octree_batch(points, config):
     ``children == {}``），不留任何分支。深度上限来自 ``config["max_depth"]``，
     并写进每棵树的根节点。
     """
-    raise NotImplementedError
+    max_depth = config["max_depth"]
+    roots = []
+    for point_set in points:
+        root = {
+            "depth": 0,
+            "x": 0,
+            "y": 0,
+            "z": 0,
+            "max_depth": max_depth,
+            "points": {},
+            "children": {},
+        }
+        for point, value in point_set.items():
+            insert(root, point, value)
+        roots.append(root)
+    return {"roots": roots}
